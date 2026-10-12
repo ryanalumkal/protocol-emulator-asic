@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 Ryan Neil Alumkal
+ * Copyright (c) 2026 Ryan Neil Alumkal
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -52,16 +52,41 @@ module tt_um_ryanalumkal (
   wire [1:0] mov_op  = instr_reg[4:3];
   wire [2:0] mov_src = instr_reg[2:0];
 
+  // IN/OUT shift amount: 0 or anything > 8 means a full 8 bits
+  wire [3:0] in_count = (bit_count == 0 || bit_count > 8) ? 4'd8 : bit_count[3:0];
+  wire [7:0] in_mask  = 8'hFF >> (4'd8 - in_count);
+
   reg [7:0] pins_out;
   reg [7:0] pins_oe;
 
-  assign uio_out = pins_out;
-  assign uio_oe  = pins_oe;
-  assign uo_out  = pins_out;  // optional mirror, or leave 0 for now
+  // ui_in  = state machine input pins (WAIT, IN)
+  // uo_out = state machine output pins (SET, OUT); SET only reaches uo_out[4:0]
+  //
+  // uio = host interface, laid out as a standard SPI Pmod:
+  //   uio[0] in  cs_n         uio[4] out tx_full
+  //   uio[1] in  mosi         uio[5] out rx_not_empty
+  //   uio[2] out miso         uio[6] out running
+  //   uio[3] in  sck          uio[7] -   spare
+  wire spi_cs_n = uio_in[0];
+  wire spi_mosi = uio_in[1];
+  wire spi_sck  = uio_in[3];
 
-  // WAIT GPIO: stall until uio_in[index] == polarity
-  wire wait_gpio = uio_in[index[2:0]];
+  // TODO: drive these from the SPI host interface, FIFOs and run control
+  wire spi_miso     = 1'b0;
+  wire tx_full      = 1'b0;
+  wire rx_not_empty = 1'b0;
+  wire running      = 1'b0;
+
+  assign uo_out  = pins_out;
+  assign uio_out = {1'b0, running, rx_not_empty, tx_full, 1'b0, spi_miso, 2'b00};
+  assign uio_oe  = 8'b0111_0100;
+
+  // WAIT GPIO: stall until ui_in[index] == polarity
+  wire wait_gpio = ui_in[index[2:0]];
   wire wait_cond = (wait_gpio == wait_pol);
+
+  // fifo #(.DATA_WIDTH(8), ADDR_WIDTH(2)) rx_fifo (.clk (clk), .rst_n(rst_n), .data_in(), data_out);
+  // fifo #(.DATA_WIDTH(8), ADDR_WIDTH(2)) tx_fifo (.clk (clk), .rst_n(rst_n), .data_in(), data_out);
 
   always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
@@ -117,6 +142,75 @@ module tt_um_ryanalumkal (
             pc <= pc + 1;
         end
 
+        3'b010: begin // IN
+          case(src_high) 
+            3'b000: begin //PINS(ui_in)
+              isr <= (isr << in_count) | (ui_in & in_mask);
+            end
+            3'b001: begin //X
+              isr <= (isr << in_count) | (x & in_mask);
+            end
+            3'b010: begin //Y
+              isr <= (isr << in_count) | (y & in_mask);
+            end
+            3'b011: begin //NULL (zeros)
+              isr <= (isr << in_count) | (0 & in_mask);
+            end
+            3'b100: begin //reserved
+            end
+            3'b101: begin //reserved
+            end
+            3'b110: begin //ISR
+              isr <= (isr << in_count) | (isr & in_mask);
+            end
+            3'b111: begin //OSR
+              isr <= (isr << in_count) | (osr & in_mask);
+            end
+          endcase
+          pc <= pc + 1;
+        end
+
+        3'b011: begin // OUT
+          case(dest) 
+              3'b000: begin //PINS(pin_out)
+                pins_out  <= (pins_out & ~in_mask) | (osr & in_mask);
+              end
+              3'b001: begin //X
+                x         <= osr & in_mask;
+              end
+              3'b010: begin //Y
+                y         <= osr & in_mask;
+              end
+              3'b011: begin //NULL(discard)
+              end
+              3'b100: begin //PINDIRS(pins_oe)
+                pins_oe  <= (pins_oe & ~in_mask) | (osr & in_mask);
+              end
+              3'b101: begin //PC (computed jump)
+                pc       <= osr[4:0] & in_mask[4:0]; 
+              end
+              3'b110: begin //ISR
+                isr      <= osr & in_mask; 
+              end
+              3'b111: begin //EXEC (skip)
+              end
+            endcase
+            if (dest != 3'b101) pc <= pc + 1;
+            osr <= osr >> in_count;
+        end
+
+        3'b100: begin //PUSH
+
+        end
+
+        3'b101: begin //MOV
+
+        end
+
+        3'b110: begin //IRQ
+
+        end
+
         3'b111: begin  // SET
           case (dest)
             3'b000: pins_out <= {3'b000, set_data};
@@ -134,6 +228,46 @@ module tt_um_ryanalumkal (
   end
 
   // List all unused inputs to prevent warnings
-  wire _unused = &{ena, 1'b0};
+  wire _unused = &{ena, spi_cs_n, spi_mosi, spi_sck, uio_in[7:4], uio_in[2], 1'b0};
 
 endmodule
+
+
+// module fifo #( 
+//   parameter DATA_WIDTH = 8;
+//   parameter ADDR_WIDTH = 2;
+// ) (
+//   input wire                  clk;
+//   input wire                  rst_n;
+//   input wire                  wr_en;
+//   input wire                  rd_en;
+//   input wire [DATA_WIDTH-1:0] data_in;
+//   output reg [DATA_WIDTH-1:0] data_out;
+//   output wire                 full;
+//   output wire                 empty;
+// );
+
+//   localparam DEPTH = 1 << ADDR_WIDTH;
+
+//   reg pointer;
+
+//   reg [DATA_WIDTH-1:0] mem [0:DEPTH-1];
+
+//   full = (pointer == DEPTH);
+//   empty = (pointer == 0);
+
+//   always @ (posedge clk or negedge rst_n) begin
+//     if (!rst_n) begin
+//       mem <= 0;
+//       pointer <= 0;
+//     end else begin
+//       if (!full && wr_en) begin
+  
+//       end
+//     end
+
+
+//   end
+
+
+// endmodule
