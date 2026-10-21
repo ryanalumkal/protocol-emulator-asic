@@ -44,4 +44,11 @@ module tb ();
       user_project.instruction_memory[imem_addr] <= imem_wdata;
   end
 
+  // Host FIFO observability for cocotb (SPI not wired yet).
+  // Cocotb pulses user_project.host_tx_wr_en / host_tx_wdata / host_rx_rd_en.
+  wire [7:0] tb_rx_data  = user_project.rx_rdata;
+  wire       tb_rx_empty = user_project.rx_empty;
+  wire       tb_tx_full  = user_project.tx_full;
+  wire       tb_tx_empty = user_project.tx_empty;
+
 endmodule
