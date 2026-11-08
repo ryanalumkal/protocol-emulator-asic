@@ -59,6 +59,8 @@ WAIT_GPIO = 0b00
 # uio is the SPI host interface: miso, tx_full, rx_not_empty, running are outputs
 UIO_OE_HOST = 0b0111_0100
 
+IMEM_DEPTH = 16
+
 
 def encode_jmp(address, condition=JMP_ALWAYS, delay=0):
     return (
@@ -152,29 +154,23 @@ async def start_clock(dut):
     dut.ena.value = 1
     dut.ui_in.value = 0
     dut.uio_in.value = 0
-    dut.imem_we.value = 0
 
 
 async def load_program(dut, program):
-    """Write 32 instruction words while held in reset, then release."""
+    """Reset, write all 16 IMEM words through the host port while halted, then run."""
     dut.rst_n.value = 0
-    dut.imem_we.value = 0
     await ClockCycles(dut.clk, 2)
+    dut.rst_n.value = 1
 
-    words = [halt(i) for i in range(32)]
+    words = [halt(i) for i in range(IMEM_DEPTH)]
     for i, word in enumerate(program):
         words[i] = word
 
     for addr, word in enumerate(words):
-        dut.imem_addr.value = addr
-        dut.imem_wdata.value = word
-        dut.imem_we.value = 1
-        await ClockCycles(dut.clk, 1)
+        await host_imem_write(dut, addr, word)
 
-    dut.imem_we.value = 0
-    await ClockCycles(dut.clk, 1)
-    dut.rst_n.value = 1
-    # First edge after reset release executes instruction 0
+    sm(dut).running.value = 1
+    # First edge after running goes high executes instruction 0
     await ClockCycles(dut.clk, 2)
 
 
@@ -191,6 +187,15 @@ async def run_with_osr(dut, osr, program, cycles=10):
     await ClockCycles(dut.clk, 1)
     dut.ui_in.value = 0x80
     await ClockCycles(dut.clk, cycles)
+
+
+async def host_imem_write(dut, addr, word):
+    """Pulse a one-cycle host write into instruction memory."""
+    await FallingEdge(dut.clk)
+    sm(dut).host_imem_addr.value = addr
+    sm(dut).host_imem_wdata.value = word
+    sm(dut).host_imem_we.value = 1
+    await RisingEdge(dut.clk)
 
 
 async def host_tx_write(dut, data):

@@ -34,21 +34,14 @@ module tb ();
       .rst_n  (rst_n)
   );
 
-  // Load PIO instruction memory from cocotb while rst_n is low
-  reg        imem_we = 1'b0;
-  reg [4:0]  imem_addr = 5'd0;
-  reg [15:0] imem_wdata = 16'd0;
-
-  always @(posedge clk) begin
-    if (imem_we)
-      user_project.instruction_memory[imem_addr] <= imem_wdata;
-  end
-
-  // Host FIFO observability for cocotb (SPI not wired yet).
-  // Cocotb pulses user_project.host_tx_wr_en / host_tx_wdata / host_rx_rd_en.
+`ifndef GL_TEST
+  // Host interface for cocotb (SPI not wired yet). Cocotb pulses
+  // user_project.host_imem_we / host_tx_wr_en / host_rx_rd_en and sets running.
+  // Internal nets don't exist in the gate-level netlist, so RTL only.
   wire [7:0] tb_rx_data  = user_project.rx_rdata;
   wire       tb_rx_empty = user_project.rx_empty;
   wire       tb_tx_full  = user_project.tx_full;
   wire       tb_tx_empty = user_project.tx_empty;
+`endif
 
 endmodule

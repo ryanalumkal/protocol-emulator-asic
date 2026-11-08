@@ -137,7 +137,7 @@ class PioState:
 
 @dataclass
 class PioModel:
-    imem_depth: int = 32
+    imem_depth: int = 16
     state: PioState = field(default_factory=PioState)
     imem: list = field(default_factory=list)
     coverage: Counter = field(default_factory=Counter)
@@ -195,7 +195,8 @@ class PioModel:
         low = instr & 0x1F
         count = shift_count(instr)
         mask = 0xFF >> (8 - count)
-        next_pc = (s.pc + 1) & 0x1F
+        pc_mask = self.imem_depth - 1  # RTL PC is just wide enough for IMEM, so it wraps
+        next_pc = (s.pc + 1) & pc_mask
 
         if op == OP_JMP:
             if sel == 0:
@@ -217,7 +218,7 @@ class PioModel:
             else:
                 taken = False
             self.coverage[("JMP", JMP_CONDS[sel] or "ALWAYS", "taken" if taken else "not_taken")] += 1
-            s.pc = low if taken else next_pc
+            s.pc = (low & pc_mask) if taken else next_pc
 
         elif op == OP_WAIT:
             pol = (instr >> 7) & 1
@@ -247,7 +248,7 @@ class PioModel:
                 s.pins_oe = (s.pins_oe & ~mask & 0xFF) | data
             elif sel == 6:
                 s.isr = data
-            s.pc = data & 0x1F if sel == 5 else next_pc
+            s.pc = data & pc_mask if sel == 5 else next_pc
             s.osr = s.osr >> count
             s.osr_count = max(0, s.osr_count - count)
             self.coverage[("OUT", OUT_DESTS[sel])] += 1
@@ -316,7 +317,7 @@ class PioModel:
                 s.isr = result
             elif sel == 7:
                 s.osr = result
-            s.pc = (result & 0x1F) if sel == 5 else next_pc
+            s.pc = (result & pc_mask) if sel == 5 else next_pc
             self.coverage[("MOV", MOV_DESTS[sel])] += 1
             self.coverage[("MOV_SRC", MOV_SRCS[mov_src])] += 1
             self.coverage[("MOV_OP", MOV_OPS[mov_op] or "NONE")] += 1

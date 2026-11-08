@@ -16,7 +16,7 @@ module tt_um_ryanalumkal (
     input  wire       rst_n     // reset_n - low to reset
 );
 
-  reg [4:0] pc;
+  reg [3:0] pc;  // 16-word IMEM: jump targets use the low 4 address bits
   reg [7:0] osr;
   reg [7:0] isr;
   reg [7:0] x;
@@ -27,6 +27,19 @@ module tt_um_ryanalumkal (
   wire      isr_full  = (isr_count == 4'd8);
 
   reg [15:0] instruction_memory [0:15];  // 16-bit, 16-word instruction memory
+
+  // Host control (TB now, SPI later). running is a level the host sets/clears;
+  // the SM only executes while it is high.
+  reg        running;
+  reg        host_imem_we;
+  reg  [3:0] host_imem_addr;
+  reg [15:0] host_imem_wdata;
+
+  // IMEM write port: no reset, so a program survives rst_n
+  always @(posedge clk) begin
+    if (host_imem_we)
+      instruction_memory[host_imem_addr] <= host_imem_wdata;
+  end
 
   // Current instruction
   wire [15:0] instr_reg = instruction_memory[pc];
@@ -79,9 +92,9 @@ module tt_um_ryanalumkal (
   wire       rx_not_empty = !rx_empty;
 
   // SM FIFO side-effects are combinational so the FIFO updates on the same edge
-  wire pull_do = (opcode == 3'b100) && push_pull_dir
+  wire pull_do = running && (opcode == 3'b100) && push_pull_dir
                  && !(flag_6 && !osr_empty) && !tx_empty;
-  wire push_do = (opcode == 3'b100) && !push_pull_dir
+  wire push_do = running && (opcode == 3'b100) && !push_pull_dir
                  && !(flag_6 && !isr_full) && !rx_full;
 
   wire       tx_wr_en = host_tx_wr_en;
@@ -113,6 +126,19 @@ module tt_um_ryanalumkal (
     .empty   (rx_empty)
   );
 
+  // ui_in  = state machine input pins (WAIT, IN)
+  // uo_out = state machine output pins (SET, OUT); SET only reaches uo_out[4:0]
+  //
+  // uio = host interface, laid out as a standard SPI Pmod:
+  //   uio[0] in  cs_n         uio[4] out tx_full
+  //   uio[1] in  mosi         uio[5] out rx_not_empty
+  //   uio[2] out miso         uio[6] out running
+  //   uio[3] in  sck          uio[7] -   spare
+  wire spi_cs_n = uio_in[0];
+  wire spi_mosi = uio_in[1];
+  wire spi_sck  = uio_in[3];
+  wire spi_miso = 1'b0;  // TODO: driven by the SPI block
+
   assign uo_out  = pins_out;
   assign uio_out = {1'b0, running, rx_not_empty, tx_full, 1'b0, spi_miso, 2'b00};
   assign uio_oe  = 8'b0111_0100;
@@ -138,30 +164,6 @@ module tt_um_ryanalumkal (
       (mov_op == 2'b10) ? mov_bitrev   :
                           mov_src_val;
 
-  reg running = 1'b0;
-
-  // ui_in  = state machine input pins (WAIT, IN)
-  // uo_out = state machine output pins (SET, OUT); SET only reaches uo_out[4:0]
-  //
-  // uio = host interface, laid out as a standard SPI Pmod:
-  //   uio[0] in  cs_n         uio[4] out tx_full
-  //   uio[1] in  mosi         uio[5] out rx_not_empty
-  //   uio[2] out miso         uio[6] out running
-  //   uio[3] in  sck          uio[7] -   spare
-  wire spi_cs_n = uio_in[0];
-  wire spi_mosi = uio_in[1];
-  assign uio_out[2] = spi_miso;
-  wire spi_sck  = uio_in[3];
-  assign uio_out[4] = tx_full;
-  assign uio_out[5] = rx_not_empty;
-  assign uio_out[6] = running;
-
-  // SPI Interface
-  
-  always @(posedge clk) begin
-
-  end
-
   // MAIN FSM
   always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
@@ -177,44 +179,49 @@ module tt_um_ryanalumkal (
       host_tx_wr_en <= 0;
       host_tx_wdata <= 0;
       host_rx_rd_en <= 0;
-      running <= 0;
+      host_imem_we    <= 0;
+      host_imem_addr  <= 0;
+      host_imem_wdata <= 0;
+      running       <= 0;
     end else begin
       // Host strobes are one-shot; TB/SPI must re-assert each cycle
       host_tx_wr_en <= 1'b0;
       host_rx_rd_en <= 1'b0;
-      // EXECUTE
+      host_imem_we  <= 1'b0;
+      // EXECUTE (halted SM holds all state)
+      if (running)
       case (opcode)
         3'b000: begin  // JMP
           case (condition)
             3'b000: begin
-              pc <= address;
+              pc <= address[3:0];
             end
             3'b001: begin
-              if (!x) pc <= address;
+              if (!x) pc <= address[3:0];
               else    pc <= pc + 1;
             end
             3'b010: begin
               if (x != 0) begin
-                pc <= address;
+                pc <= address[3:0];
                 x  <= x - 1;
               end else begin
                 pc <= pc + 1;
               end
             end
             3'b011: begin
-              if (!y) pc <= address;
+              if (!y) pc <= address[3:0];
               else    pc <= pc + 1;
             end
             3'b100: begin
               if (y != 0) begin
-                pc <= address;
+                pc <= address[3:0];
                 y  <= y - 1;
               end else begin
                 pc <= pc + 1;
               end
             end
             3'b101: begin
-              if (x != y) pc <= address;
+              if (x != y) pc <= address[3:0];
               else        pc <= pc + 1;
             end
             default: pc <= pc + 1;
@@ -279,7 +286,7 @@ module tt_um_ryanalumkal (
                 pins_oe  <= (pins_oe & ~in_mask) | (osr & in_mask);
               end
               3'b101: begin //PC (computed jump)
-                pc       <= osr[4:0] & in_mask[4:0]; 
+                pc       <= osr[3:0] & in_mask[3:0];
               end
               3'b110: begin //ISR
                 isr      <= osr & in_mask; 
@@ -333,7 +340,7 @@ module tt_um_ryanalumkal (
             3'b100: begin //exec
             end
             3'b101: begin //PC (computed jump)
-              pc <= mov_result[4:0];
+              pc <= mov_result[3:0];
             end
             3'b110: begin //ISR
               isr <= mov_result;
@@ -367,7 +374,8 @@ module tt_um_ryanalumkal (
   end
 
   // List all unused inputs to prevent warnings
-  wire _unused = &{ena, spi_cs_n, spi_mosi, spi_sck, uio_in[7:4], uio_in[2], 1'b0};
+  wire _unused = &{ena, spi_cs_n, spi_mosi, spi_sck, uio_in[7:4], uio_in[2],
+                   address[4], 1'b0};
 
 `ifdef FORMAL
   `include "pio_props.vh"

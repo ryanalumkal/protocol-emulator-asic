@@ -120,7 +120,6 @@ async def start_clock(dut):
     dut.ena.value = 1
     dut.ui_in.value = 0
     dut.uio_in.value = 0
-    dut.imem_we.value = 0
 
 
 async def reset_and_load(dut, program, depth):
@@ -150,6 +149,7 @@ def deposit(dut, model, name, value):
 async def release_reset(dut, model, rng, randomize_state):
     await FallingEdge(dut.clk)
     dut.rst_n.value = 1
+    sm(dut).running.value = 1
     model.reset()
     if randomize_state:
         for name in STATE_REGS:
