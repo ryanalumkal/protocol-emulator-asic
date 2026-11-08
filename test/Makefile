@@ -38,11 +38,11 @@ TOPLEVEL = tb
 
 # List test modules to run, separated by commas and without the .py suffix.
 # test and test_scoreboard poke internal signals, so gate level runs only the
-# port-level tests in test_gl until the SPI host interface is wired up.
+# port-level tests in test_gl and test_spi.
 ifneq ($(GATES),yes)
-COCOTB_TEST_MODULES = test,test_scoreboard,test_gl
+COCOTB_TEST_MODULES = test,test_scoreboard,test_gl,test_spi
 else
-COCOTB_TEST_MODULES = test_gl
+COCOTB_TEST_MODULES = test_gl,test_spi
 endif
 
 # include cocotb's make rules to take care of the simulator setup

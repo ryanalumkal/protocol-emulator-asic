@@ -3,7 +3,9 @@
 
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import ClockCycles, FallingEdge, RisingEdge
+from cocotb.triggers import ClockCycles
+
+from spi_host import spi_idle, spi_read_rx, spi_write_imem, spi_write_tx
 
 
 # PIO encoding: [15:13] opcode, [12:8] delay, [7:0] args
@@ -153,11 +155,15 @@ async def start_clock(dut):
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
     dut.ui_in.value = 0
-    dut.uio_in.value = 0
+    spi_idle(dut)
 
 
 async def load_program(dut, program):
-    """Reset, write all 16 IMEM words through the host port while halted, then run."""
+    """Reset, write all 16 IMEM words over SPI while halted, then run.
+
+    running is set directly rather than with SPI CTRL so that instruction 0
+    executes on a known edge; test_spi.py covers CTRL itself.
+    """
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 2)
     dut.rst_n.value = 1
@@ -165,11 +171,9 @@ async def load_program(dut, program):
     words = [halt(i) for i in range(IMEM_DEPTH)]
     for i, word in enumerate(program):
         words[i] = word
+    await spi_write_imem(dut, 0, words)
 
-    for addr, word in enumerate(words):
-        await host_imem_write(dut, addr, word)
-
-    sm(dut).running.value = 1
+    sm(dut).spi.running.value = 1
     # First edge after running goes high executes instruction 0
     await ClockCycles(dut.clk, 2)
 
@@ -187,33 +191,6 @@ async def run_with_osr(dut, osr, program, cycles=10):
     await ClockCycles(dut.clk, 1)
     dut.ui_in.value = 0x80
     await ClockCycles(dut.clk, cycles)
-
-
-async def host_imem_write(dut, addr, word):
-    """Pulse a one-cycle host write into instruction memory."""
-    await FallingEdge(dut.clk)
-    sm(dut).host_imem_addr.value = addr
-    sm(dut).host_imem_wdata.value = word
-    sm(dut).host_imem_we.value = 1
-    await RisingEdge(dut.clk)
-
-
-async def host_tx_write(dut, data):
-    """Pulse a one-cycle host write into the TX FIFO."""
-    await FallingEdge(dut.clk)
-    sm(dut).host_tx_wdata.value = data & 0xFF
-    sm(dut).host_tx_wr_en.value = 1
-    await RisingEdge(dut.clk)
-
-
-async def host_rx_read(dut):
-    """Pulse a one-cycle host read from the RX FIFO; return the data word."""
-    assert int(sm(dut).rx_empty.value) == 0, "RX FIFO empty"
-    data = int(sm(dut).rx_rdata.value)
-    await FallingEdge(dut.clk)
-    sm(dut).host_rx_rd_en.value = 1
-    await RisingEdge(dut.clk)
-    return data
 
 
 # ---------------------------------------------------------------------------
@@ -1049,7 +1026,7 @@ async def test_pull_loads_osr_from_tx(dut):
     assert sm(dut).pc.value == 0
     assert int(sm(dut).tx_empty.value) == 1
 
-    await host_tx_write(dut, 0xA5)
+    await spi_write_tx(dut, [0xA5])
     await ClockCycles(dut.clk, 3)
 
     assert sm(dut).pc.value == 2
@@ -1070,10 +1047,11 @@ async def test_pull_ife_skips_when_osr_full(dut):
             halt(2),
         ],
     )
-    await host_tx_write(dut, 0x3C)
-    # Pre-fill OSR so IfE skips the pull
+    # Pre-fill OSR so IfE skips the pull (before the TX write, which takes
+    # many cycles over SPI and would otherwise be pulled first)
     sm(dut).osr.value = 0x12
     sm(dut).osr_count.value = 8
+    await spi_write_tx(dut, [0x3C])
     await ClockCycles(dut.clk, 4)
 
     assert dut.uo_out.value == 0x12
@@ -1120,8 +1098,7 @@ async def test_push_sends_isr_to_rx(dut):
     assert int(sm(dut).rx_empty.value) == 0
     assert int(sm(dut).rx_rdata.value) == 0x5A
 
-    data = await host_rx_read(dut)
-    assert data == 0x5A
+    assert await spi_read_rx(dut, 1) == [0x5A]
     await ClockCycles(dut.clk, 1)
     assert int(sm(dut).rx_empty.value) == 1
 
@@ -1164,11 +1141,10 @@ async def test_push_pull_roundtrip(dut):
         ],
     )
 
-    await host_tx_write(dut, 0x91)
+    await spi_write_tx(dut, [0x91])
     await ClockCycles(dut.clk, 6)
 
     assert dut.uo_out.value == 0x91
     assert sm(dut).pc.value == 4
     assert int(sm(dut).rx_rdata.value) == 0xC3
-    data = await host_rx_read(dut)
-    assert data == 0xC3
+    assert await spi_read_rx(dut, 1) == [0xC3]

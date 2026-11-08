@@ -119,7 +119,7 @@ async def start_clock(dut):
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     dut.ena.value = 1
     dut.ui_in.value = 0
-    dut.uio_in.value = 0
+    dut.uio_in.value = 0x01  # SPI cs_n high (deselected)
 
 
 async def reset_and_load(dut, program, depth):
@@ -149,7 +149,7 @@ def deposit(dut, model, name, value):
 async def release_reset(dut, model, rng, randomize_state):
     await FallingEdge(dut.clk)
     dut.rst_n.value = 1
-    sm(dut).running.value = 1
+    sm(dut).spi.running.value = 1
     model.reset()
     if randomize_state:
         for name in STATE_REGS:

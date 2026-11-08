@@ -28,14 +28,19 @@ module tt_um_ryanalumkal (
 
   reg [15:0] instruction_memory [0:15];  // 16-bit, 16-word instruction memory
 
-  // Host control (TB now, SPI later). running is a level the host sets/clears;
-  // the SM only executes while it is high.
-  reg        running;
-  reg        host_imem_we;
-  reg  [3:0] host_imem_addr;
-  reg [15:0] host_imem_wdata;
+  // Host control, all driven by spi_host_if. running is a level set by CTRL;
+  // the SM executes while it is high, or for one cycle on a step pulse.
+  wire        running;
+  wire        sm_step;
+  wire        sm_rst;
+  wire        fifo_clr;
+  wire        sm_exec = running || sm_step;
+  wire        host_imem_we;
+  wire  [3:0] host_imem_addr;
+  wire [15:0] host_imem_wdata;
 
-  // IMEM write port: no reset, so a program survives rst_n
+  // IMEM write port: no reset, so a program survives rst_n.
+  // Writes are allowed while running (like RP2040 PIO).
   always @(posedge clk) begin
     if (host_imem_we)
       instruction_memory[host_imem_addr] <= host_imem_wdata;
@@ -76,12 +81,12 @@ module tt_um_ryanalumkal (
   reg [7:0] pins_out;
   reg [7:0] pins_oe;
 
-  // TX FIFO: host (SPI / TB) writes, SM (PULL) reads into OSR
-  // RX FIFO: SM (PUSH) writes from ISR, host (SPI / TB) reads
-  // Host strobes are regs the TB (later SPI) pulses for one cycle.
-  reg  [7:0] host_tx_wdata;
-  reg        host_tx_wr_en;
-  reg        host_rx_rd_en;
+  // TX FIFO: host (SPI) writes, SM (PULL) reads into OSR
+  // RX FIFO: SM (PUSH) writes from ISR, host (SPI) reads
+  // Host strobes are one-cycle pulses from spi_host_if.
+  wire [7:0] host_tx_wdata;
+  wire       host_tx_wr_en;
+  wire       host_rx_rd_en;
 
   wire [7:0] tx_rdata;
   wire       tx_full;
@@ -92,9 +97,9 @@ module tt_um_ryanalumkal (
   wire       rx_not_empty = !rx_empty;
 
   // SM FIFO side-effects are combinational so the FIFO updates on the same edge
-  wire pull_do = running && (opcode == 3'b100) && push_pull_dir
+  wire pull_do = sm_exec && !sm_rst && (opcode == 3'b100) && push_pull_dir
                  && !(flag_6 && !osr_empty) && !tx_empty;
-  wire push_do = running && (opcode == 3'b100) && !push_pull_dir
+  wire push_do = sm_exec && !sm_rst && (opcode == 3'b100) && !push_pull_dir
                  && !(flag_6 && !isr_full) && !rx_full;
 
   wire       tx_wr_en = host_tx_wr_en;
@@ -107,6 +112,7 @@ module tt_um_ryanalumkal (
   fifo #(.DATA_WIDTH(8), .ADDR_WIDTH(2)) tx_fifo (
     .clk     (clk),
     .rst_n   (rst_n),
+    .clr     (fifo_clr),
     .wr_en   (tx_wr_en),
     .rd_en   (tx_rd_en),
     .data_in (tx_wdata),
@@ -118,6 +124,7 @@ module tt_um_ryanalumkal (
   fifo #(.DATA_WIDTH(8), .ADDR_WIDTH(2)) rx_fifo (
     .clk     (clk),
     .rst_n   (rst_n),
+    .clr     (fifo_clr),
     .wr_en   (rx_wr_en),
     .rd_en   (rx_rd_en),
     .data_in (rx_wdata),
@@ -137,7 +144,31 @@ module tt_um_ryanalumkal (
   wire spi_cs_n = uio_in[0];
   wire spi_mosi = uio_in[1];
   wire spi_sck  = uio_in[3];
-  wire spi_miso = 1'b0;  // TODO: driven by the SPI block
+  wire spi_miso;
+
+  spi_host_if spi (
+    .clk       (clk),
+    .rst_n     (rst_n),
+    .sck       (spi_sck),
+    .cs_n      (spi_cs_n),
+    .mosi      (spi_mosi),
+    .miso      (spi_miso),
+    .tx_full   (tx_full),
+    .tx_empty  (tx_empty),
+    .rx_full   (rx_full),
+    .rx_empty  (rx_empty),
+    .rx_rdata  (rx_rdata),
+    .imem_we   (host_imem_we),
+    .imem_addr (host_imem_addr),
+    .imem_wdata(host_imem_wdata),
+    .tx_wr_en  (host_tx_wr_en),
+    .tx_wdata  (host_tx_wdata),
+    .rx_rd_en  (host_rx_rd_en),
+    .running   (running),
+    .sm_step   (sm_step),
+    .sm_rst    (sm_rst),
+    .fifo_clr  (fifo_clr)
+  );
 
   assign uo_out  = pins_out;
   assign uio_out = {1'b0, running, rx_not_empty, tx_full, 1'b0, spi_miso, 2'b00};
@@ -175,21 +206,21 @@ module tt_um_ryanalumkal (
       pins_out  <= 0;
       pins_oe   <= 0;
       osr_count     <= 0;
-      isr_count     <= 0;
-      host_tx_wr_en <= 0;
-      host_tx_wdata <= 0;
-      host_rx_rd_en <= 0;
-      host_imem_we    <= 0;
-      host_imem_addr  <= 0;
-      host_imem_wdata <= 0;
-      running       <= 0;
+      isr_count <= 0;
+    end else if (sm_rst) begin
+      // CTRL soft reset: same as rst_n for the SM, IMEM and SPI untouched
+      pc        <= 0;
+      osr       <= 0;
+      isr       <= 0;
+      x         <= 0;
+      y         <= 0;
+      pins_out  <= 0;
+      pins_oe   <= 0;
+      osr_count <= 0;
+      isr_count <= 0;
     end else begin
-      // Host strobes are one-shot; TB/SPI must re-assert each cycle
-      host_tx_wr_en <= 1'b0;
-      host_rx_rd_en <= 1'b0;
-      host_imem_we  <= 1'b0;
       // EXECUTE (halted SM holds all state)
-      if (running)
+      if (sm_exec)
       case (opcode)
         3'b000: begin  // JMP
           case (condition)
@@ -197,7 +228,7 @@ module tt_um_ryanalumkal (
               pc <= address[3:0];
             end
             3'b001: begin
-              if (!x) pc <= address[3:0];
+              if (x == 0) pc <= address[3:0];
               else    pc <= pc + 1;
             end
             3'b010: begin
@@ -209,7 +240,7 @@ module tt_um_ryanalumkal (
               end
             end
             3'b011: begin
-              if (!y) pc <= address[3:0];
+              if (y == 0) pc <= address[3:0];
               else    pc <= pc + 1;
             end
             3'b100: begin
@@ -374,8 +405,9 @@ module tt_um_ryanalumkal (
   end
 
   // List all unused inputs to prevent warnings
-  wire _unused = &{ena, spi_cs_n, spi_mosi, spi_sck, uio_in[7:4], uio_in[2],
-                   address[4], 1'b0};
+  // delay_side_set and wait_src are reserved instruction fields (not implemented yet)
+  wire _unused = &{ena, uio_in[7:4], uio_in[2], address[4], index[4:3],
+                   delay_side_set, wait_src, 1'b0};
 
 `ifdef FORMAL
   `include "pio_props.vh"
@@ -390,6 +422,7 @@ module fifo #(
 ) (
   input wire                  clk,
   input wire                  rst_n,
+  input wire                  clr,    // synchronous flush
   input wire                  wr_en,
   input wire                  rd_en,
   input wire [DATA_WIDTH-1:0] data_in,
@@ -415,6 +448,9 @@ module fifo #(
     if (!rst_n) begin
       wr_ptr <= 0;
       rd_ptr <= 0;
+    end else if (clr) begin
+      wr_ptr <= 0;
+      rd_ptr <= 0;
     end else begin
       if (!full && wr_en) begin
         mem[wr_ptr[ADDR_WIDTH-1:0]] <= data_in;
@@ -422,6 +458,208 @@ module fifo #(
       end
       if (!empty && rd_en) begin
         rd_ptr <= rd_ptr + 1;
+      end
+    end
+  end
+
+endmodule
+
+
+// SPI host interface: mode 0 (CPOL=0, CPHA=0), MSB first, single device.
+// SCK must be <= clk/8.
+//
+// Each cs_n-low transaction starts with a command byte {op[3:0], arg[3:0]};
+// MISO returns the status byte while the command shifts in.
+//   0x00  STATUS      clear sticky tx_ovf / rx_udf (after reporting them)
+//   0x1a  WRITE_IMEM  {hi, lo} pairs, written at a, a+1, ... (wraps at 16)
+//   0x20  WRITE_TX    data bytes into TX FIFO (dropped + tx_ovf when full)
+//   0x30  READ_RX     data bytes out of RX FIFO (0x00 + rx_udf when empty)
+//   0x4b  CTRL        b[0] running <= b0, b[1] step, b[2] SM reset, b[3] FIFO flush
+// Status: {running, tx_full, tx_empty, rx_full, rx_empty, tx_ovf, rx_udf, 1}
+module spi_host_if (
+  input  wire        clk,
+  input  wire        rst_n,
+  input  wire        sck,
+  input  wire        cs_n,
+  input  wire        mosi,
+  output wire        miso,
+  input  wire        tx_full,
+  input  wire        tx_empty,
+  input  wire        rx_full,
+  input  wire        rx_empty,
+  input  wire  [7:0] rx_rdata,
+  output reg         imem_we,
+  output reg   [3:0] imem_addr,
+  output reg  [15:0] imem_wdata,
+  output reg         tx_wr_en,
+  output reg   [7:0] tx_wdata,
+  output reg         rx_rd_en,
+  output reg         running,
+  output reg         sm_step,
+  output reg         sm_rst,
+  output reg         fifo_clr
+);
+
+  localparam CMD_STATUS     = 4'h0;
+  localparam CMD_WRITE_IMEM = 4'h1;
+  localparam CMD_WRITE_TX   = 4'h2;
+  localparam CMD_READ_RX    = 4'h3;
+  localparam CMD_CTRL       = 4'h4;
+
+  // 2-flop synchronizers; a third sck/cs_n flop gives edge detection.
+  // mosi uses the same depth so it lines up with sck.
+  reg [2:0] sck_q;
+  reg [2:0] cs_q;
+  reg [1:0] mosi_q;
+
+  wire sck_rise  = sck_q[1] & ~sck_q[2];
+  wire sck_fall  = ~sck_q[1] & sck_q[2];
+  wire cs_active = ~cs_q[1];
+  wire cs_start  = cs_q[2] & ~cs_q[1];
+
+  reg [2:0] bit_cnt;
+  reg [6:0] rx_shift;   // bit 7 of a byte arrives with its last SCK rise
+  reg [7:0] tx_shift;
+  reg       have_cmd;   // command byte received this transaction
+  reg [3:0] cmd_op;
+  reg [3:0] addr;       // WRITE_IMEM word address
+  reg [7:0] hi_byte;    // WRITE_IMEM high byte waiting for its low byte
+  reg       hi_valid;
+  reg       load_next;  // byte boundary: load tx_shift on the next sck fall
+  reg       rx_slot;    // tx_shift holds a READ_RX byte not yet clocked out
+  reg       rx_slot_valid;
+  reg       tx_ovf;
+  reg       rx_udf;
+
+  wire [7:0] rx_byte   = {rx_shift[6:0], mosi_q[1]};
+  wire       byte_done = cs_active && sck_rise && (bit_cnt == 3'd7);
+  wire [7:0] status    = {running, tx_full, tx_empty, rx_full, rx_empty,
+                          tx_ovf, rx_udf, 1'b1};
+
+  assign miso = cs_active & tx_shift[7];
+
+  always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      sck_q         <= 3'b000;
+      cs_q          <= 3'b111;
+      mosi_q        <= 2'b00;
+      bit_cnt       <= 0;
+      rx_shift      <= 0;
+      tx_shift      <= 0;
+      have_cmd      <= 0;
+      cmd_op        <= 0;
+      addr          <= 0;
+      hi_byte       <= 0;
+      hi_valid      <= 0;
+      load_next     <= 0;
+      rx_slot       <= 0;
+      rx_slot_valid <= 0;
+      tx_ovf        <= 0;
+      rx_udf        <= 0;
+      imem_we       <= 0;
+      imem_addr     <= 0;
+      imem_wdata    <= 0;
+      tx_wr_en      <= 0;
+      tx_wdata      <= 0;
+      rx_rd_en      <= 0;
+      running       <= 0;
+      sm_step       <= 0;
+      sm_rst        <= 0;
+      fifo_clr      <= 0;
+    end else begin
+      sck_q  <= {sck_q[1:0], sck};
+      cs_q   <= {cs_q[1:0], cs_n};
+      mosi_q <= {mosi_q[0], mosi};
+
+      // Strobes are one-shot
+      imem_we  <= 1'b0;
+      tx_wr_en <= 1'b0;
+      rx_rd_en <= 1'b0;
+      sm_step  <= 1'b0;
+      sm_rst   <= 1'b0;
+      fifo_clr <= 1'b0;
+
+      if (!cs_active) begin
+        bit_cnt   <= 0;
+        have_cmd  <= 0;
+        hi_valid  <= 0;
+        load_next <= 0;
+        rx_slot   <= 0;
+      end else if (cs_start) begin
+        tx_shift <= status;
+      end else begin
+        if (sck_rise) begin
+          rx_shift <= rx_byte[6:0];
+          bit_cnt  <= bit_cnt + 1;
+          // Commit a READ_RX pop only once its first bit is actually clocked,
+          // so the trailing sck fall of a transaction doesn't eat a byte.
+          if (rx_slot) begin
+            if (rx_slot_valid) rx_rd_en <= 1'b1;
+            else               rx_udf   <= 1'b1;
+            rx_slot <= 1'b0;
+          end
+        end
+
+        if (byte_done) begin
+          load_next <= 1'b1;
+          if (!have_cmd) begin
+            have_cmd <= 1'b1;
+            cmd_op   <= rx_byte[7:4];
+            addr     <= rx_byte[3:0];
+            case (rx_byte[7:4])
+              CMD_STATUS: begin
+                tx_ovf <= 1'b0;
+                rx_udf <= 1'b0;
+              end
+              CMD_CTRL: begin
+                running  <= rx_byte[0];
+                sm_step  <= rx_byte[1];
+                sm_rst   <= rx_byte[2];
+                fifo_clr <= rx_byte[3];
+              end
+              default: ;
+            endcase
+          end else begin
+            case (cmd_op)
+              CMD_WRITE_IMEM: begin
+                if (!hi_valid) begin
+                  hi_byte  <= rx_byte;
+                  hi_valid <= 1'b1;
+                end else begin
+                  imem_we    <= 1'b1;
+                  imem_addr  <= addr;
+                  imem_wdata <= {hi_byte, rx_byte};
+                  addr       <= addr + 1;
+                  hi_valid   <= 1'b0;
+                end
+              end
+              CMD_WRITE_TX: begin
+                if (tx_full) begin
+                  tx_ovf <= 1'b1;
+                end else begin
+                  tx_wr_en <= 1'b1;
+                  tx_wdata <= rx_byte;
+                end
+              end
+              default: ;  // READ_RX ignores MOSI; unknown ops are ignored
+            endcase
+          end
+        end
+
+        if (sck_fall) begin
+          if (load_next) begin
+            load_next <= 1'b0;
+            if (have_cmd && cmd_op == CMD_READ_RX) begin
+              tx_shift      <= rx_empty ? 8'h00 : rx_rdata;
+              rx_slot       <= 1'b1;
+              rx_slot_valid <= !rx_empty;
+            end else begin
+              tx_shift <= 8'h00;
+            end
+          end else begin
+            tx_shift <= {tx_shift[6:0], 1'b0};
+          end
+        end
       end
     end
   end

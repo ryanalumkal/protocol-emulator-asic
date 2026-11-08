@@ -35,9 +35,8 @@ module tb ();
   );
 
 `ifndef GL_TEST
-  // Host interface for cocotb (SPI not wired yet). Cocotb pulses
-  // user_project.host_imem_we / host_tx_wr_en / host_rx_rd_en and sets running.
-  // Internal nets don't exist in the gate-level netlist, so RTL only.
+  // FIFO observability for cocotb. The host side is driven over SPI on uio_in
+  // (see spi_host.py). Internal nets don't exist in the gate-level netlist, so RTL only.
   wire [7:0] tb_rx_data  = user_project.rx_rdata;
   wire       tb_rx_empty = user_project.rx_empty;
   wire       tb_tx_full  = user_project.tx_full;

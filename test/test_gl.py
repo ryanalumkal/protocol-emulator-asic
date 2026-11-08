@@ -18,7 +18,7 @@ async def test_reset_pins(dut):
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     dut.ena.value = 1
     dut.ui_in.value = 0
-    dut.uio_in.value = 0
+    dut.uio_in.value = 0x01  # SPI cs_n high (deselected)
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 5)
     dut.rst_n.value = 1
